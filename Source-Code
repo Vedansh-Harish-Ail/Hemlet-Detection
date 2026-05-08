@@ -1,10 +1,11 @@
 #include "esp_camera.h"
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
+#include <WebServer.h>
 
-const char* WIFI_SSID  = "Yourssidname";
-const char* WIFI_PASS  = "YourWifiPassword";
-const char* API_KEY    = "Yourapikey";
+const char* WIFI_SSID  = "yourssidname";
+const char* WIFI_PASS  = "yourwifipassword";
+const char* API_KEY    = "cd_jre_140326_UkVdeG";
 const char* serverName = "www.circuitdigest.cloud";
 const char* serverPath = "/api/v1/helmet-detection/detect";
 const int   serverPort = 443;
@@ -29,7 +30,13 @@ const int   serverPort = 443;
 #define PCLK_GPIO_NUM  22
 
 WiFiClientSecure client;
+WebServer previewServer(80);
 unsigned long lastTrigger = 0;
+
+volatile bool streamingActive = false;  // is someone watching the stream?
+volatile bool buttonPressed   = false;  // button was pressed, pause stream
+
+SemaphoreHandle_t cameraMutex;          // ← only one task uses camera at a time
 
 void initCamera() {
   camera_config_t cfg = {};
@@ -44,34 +51,93 @@ void initCamera() {
   cfg.pin_pwdn     = PWDN_GPIO_NUM;  cfg.pin_reset = RESET_GPIO_NUM;
   cfg.xclk_freq_hz = 20000000;
   cfg.pixel_format = PIXFORMAT_JPEG;
-  cfg.frame_size   = FRAMESIZE_VGA;  // ✅ reduced for faster upload
+  cfg.frame_size   = FRAMESIZE_VGA;
   cfg.jpeg_quality = 10;
-  cfg.fb_count     = 1;
+  cfg.fb_count     = 2;
 
   if (esp_camera_init(&cfg) != ESP_OK) {
     Serial.println("Camera init failed!"); while (1) delay(1000);
   }
-
   sensor_t* s = esp_camera_sensor_get();
-  s->set_brightness(s, 1);
-  s->set_contrast(s, 2);
-  s->set_saturation(s, 0);
-  s->set_whitebal(s, 1);
-  s->set_exposure_ctrl(s, 1);
-  s->set_gain_ctrl(s, 1);
-  s->set_aec2(s, 1);
-  s->set_ae_level(s, 1);
-
+  s->set_brightness(s, 1); s->set_contrast(s, 2);
+  s->set_saturation(s, 0); s->set_whitebal(s, 1);
+  s->set_exposure_ctrl(s, 1); s->set_gain_ctrl(s, 1);
+  s->set_aec2(s, 1); s->set_ae_level(s, 1);
   Serial.println("Camera initialized.");
 }
 
+// ─── Runs on Core 0 — handles web server + streaming ──────────
+void webServerTask(void* param) {
+  while (true) {
+    previewServer.handleClient();
+    vTaskDelay(1);   // yield to other tasks
+  }
+}
+
+void handleRoot() {
+  previewServer.send(200, "text/html",
+    "<html><head>"
+    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<script>"
+    // auto-reconnect stream if it drops (after detection finishes)
+    "window.onload=function(){"
+    "  var img=document.getElementById('s');"
+    "  img.onerror=function(){setTimeout(function(){img.src='/stream?t='+Date.now();},3000);};"
+    "};"
+    "</script>"
+    "</head>"
+    "<body style='background:#000;text-align:center'>"
+    "<h2 style='color:#fff'>Camera Preview</h2>"
+    "<p style='color:#aaa'>Press physical button to capture &amp; detect</p>"
+    "<img id='s' src='/stream' style='width:100%;max-width:640px'>"
+    "</body></html>"
+  );
+}
+
+void handleStream() {
+  WiFiClient streamClient = previewServer.client();
+  streamClient.println("HTTP/1.1 200 OK");
+  streamClient.println("Content-Type: multipart/x-mixed-replace; boundary=frame");
+  streamClient.println();
+
+  streamingActive = true;
+
+  while (streamClient.connected()) {
+    // ← if button pressed, pause and wait until detection is done
+    if (buttonPressed) {
+      vTaskDelay(100 / portTICK_PERIOD_MS);
+      continue;   // keep connection alive but don't grab camera
+    }
+
+    // ← try to get camera mutex (detection task might be using it)
+    if (xSemaphoreTake(cameraMutex, 10 / portTICK_PERIOD_MS) == pdTRUE) {
+      camera_fb_t* fb = esp_camera_fb_get();
+      xSemaphoreGive(cameraMutex);   // ← release immediately after get
+
+      if (fb) {
+        streamClient.println("--frame");
+        streamClient.println("Content-Type: image/jpeg");
+        streamClient.println("Content-Length: " + String(fb->len));
+        streamClient.println();
+        streamClient.write(fb->buf, fb->len);
+        streamClient.println();
+        esp_camera_fb_return(fb);
+      }
+    }
+    vTaskDelay(50 / portTICK_PERIOD_MS);  // ~20fps
+  }
+
+  streamingActive = false;
+}
+
+// ─── Original API code untouched ──────────────────────────────
 String sendImageToAPI(camera_fb_t* fb) {
   Serial.println("Connecting to server...");
   if (!client.connect(serverName, serverPort)) {
-    Serial.println("Connection failed to: " + String(serverName));
+    Serial.println("Connection failed!");
     return "Connection failed";
   }
-  Serial.println("Connected to server!");
+  Serial.println("Connected!");
 
   String boundary = "----ESP32Boundary";
   String head = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"imageFile\"; filename=\"snap.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
@@ -90,13 +156,9 @@ String sendImageToAPI(camera_fb_t* fb) {
   client.print(tail);
 
   Serial.println("Image sent! Waiting for response...");
-
   long t = millis();
   while (!client.available()) {
-    if (millis() - t > 15000) {
-      client.stop();
-      return "Timeout";
-    }
+    if (millis() - t > 15000) { client.stop(); return "Timeout"; }
   }
 
   String response = "";
@@ -108,7 +170,6 @@ String sendImageToAPI(camera_fb_t* fb) {
 }
 
 void checkHelmets() {
-  // ✅ Check WiFi before capturing
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi disconnected! Reconnecting...");
     WiFi.begin(WIFI_SSID, WIFI_PASS);
@@ -123,25 +184,30 @@ void checkHelmets() {
     Serial.println("WiFi reconnected!");
   }
 
-  // Warm-up frame
-  camera_fb_t* fb = esp_camera_fb_get();
+  // ← take mutex so stream task can't grab camera at same time
+  xSemaphoreTake(cameraMutex, portMAX_DELAY);
+
+  camera_fb_t* fb = esp_camera_fb_get();   // warm-up
   esp_camera_fb_return(fb);
   delay(200);
 
-  // Real frame
   fb = esp_camera_fb_get();
+  xSemaphoreGive(cameraMutex);   // ← release mutex after capture
+
   if (!fb) { Serial.println("Capture failed"); return; }
 
   Serial.println("Photo captured! Sending to API...");
   String result = sendImageToAPI(fb);
   esp_camera_fb_return(fb);
-
   Serial.println("Response: " + result);
 }
 
 void setup() {
   Serial.begin(115200);
   pinMode(TRIGGER_BTN, INPUT_PULLUP);
+
+  cameraMutex = xSemaphoreCreateMutex();   // ← create mutex
+
   initCamera();
   client.setInsecure();
 
@@ -149,12 +215,24 @@ void setup() {
   Serial.print("Connecting to WiFi");
   while (!WiFi.isConnected()) { delay(500); Serial.print("."); }
   Serial.println("\nConnected: " + WiFi.localIP().toString());
+  Serial.println("Preview at: http://" + WiFi.localIP().toString());
+
+  previewServer.on("/", handleRoot);
+  previewServer.on("/stream", handleStream);
+  previewServer.begin();
+
+  // ← web server runs on Core 0, loop() runs on Core 1
+  xTaskCreatePinnedToCore(webServerTask, "webTask", 8192, NULL, 1, NULL, 0);
 }
 
 void loop() {
+  // ← this now always runs freely on Core 1, never blocked by streaming
   if (digitalRead(TRIGGER_BTN) == LOW && millis() - lastTrigger > 500) {
     lastTrigger = millis();
-    Serial.println("Button pressed! Capturing image...");
-    checkHelmets();
+    Serial.println("Button pressed! Capturing...");
+    buttonPressed = true;    // ← tell stream to pause
+    delay(100);              // ← wait for stream to pause
+    checkHelmets();          // ← detect
+    buttonPressed = false;   // ← stream resumes automatically
   }
 }
