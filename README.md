@@ -46,32 +46,12 @@ What feels like a high-end surveillance system is now reduced to a simple, affor
 
 ---
 
-## ⚙️ How It Works
-
-```
-[ Push Button Pressed ]
-        ↓
-[ ESP32-CAM Captures Image of Riders ]
-        ↓
-[ Image Sent via Wi-Fi over HTTPS ]
-        ↓
-[ CircuitDigest Cloud API Processes Image with AI Helmet Detection Model ]
-        ↓
-[ Result Returned: Helmet Count + No-Helmet Count + Motorbike Count + Confidence ]
-        ↓
-[ Output Displayed on Serial Monitor ]
-```
-
-> **Tip:** For testing, a live image is not required — any road/rider image from the web works too! Ensure sufficient lighting and clear visibility of the rider's head area for best accuracy.
-
----
-
 ## 🧰 Components Required
 
 | S.No | Component | Purpose |
 |------|-----------|---------|
 | 1 | ESP32-CAM | Microcontroller with built-in camera & Wi-Fi |
-| 2 | Push Button | Triggers image capture on press |
+| 2 | Red and Green LED | Used to indicate the status of the system
 | 3 | Breadboard | Simplifies and organizes circuit connections |
 | 4 | USB-to-Serial (FTDI) Adapter *(if needed)* | For programming standard ESP32-CAM without onboard USB |
 | 5 | USB Cable | Powers the system via laptop/PC |
@@ -81,21 +61,6 @@ What feels like a high-end surveillance system is now reduced to a simple, affor
 > - FTDI **RX** → ESP32-CAM **TX** (U0T)
 > - **GND** → **GND**
 > - Hold **GPIO0 LOW** during upload to enter flash mode.
-
----
-
-## 🔌 Circuit Diagram
-
-The push button is connected to **GPIO13** of the ESP32-CAM to trigger image capture.
-
-```
-ESP32-CAM            Push Button
----------            -----------
- GPIO13  ───────────  One Terminal
-  GND    ───────────  Other Terminal
-```
-
-> Connect the ESP32-CAM to your laptop via USB for power. Refer to the circuit diagram image in the repository for a detailed visual reference.
 
 ---
 
@@ -146,122 +111,8 @@ const char* API_KEY    = "Your_API_Key_Here";
 4. Select **AI Thinker ESP32-CAM** as the board in Arduino IDE.
 5. Upload the code (hold **GPIO0 LOW** if using FTDI adapter).
 6. Open **Serial Monitor** at **115200 baud**.
-7. Point the camera at riders and press the push button.
-8. Helmet detection results appear on the Serial Monitor within seconds!
-
----
-
-## 💻 Code Explanation
-
-### 1. Library Includes
-
-```cpp
-#include "esp_camera.h"
-#include <WiFi.h>
-#include <WiFiClientSecure.h>
-
-WiFiClientSecure client;
-```
-
-Includes libraries for **ESP32 camera control**, **Wi-Fi connectivity**, and **secure HTTPS communication**. The `WiFiClientSecure` object safely transmits images to the cloud API. These libraries form the complete foundation for image capture and internet communication.
-
----
-
-### 2. Wi-Fi & API Configuration
-
-```cpp
-const char* WIFI_SSID  = "YourSSID";
-const char* WIFI_PASS  = "YourPassword";
-const char* API_KEY    = "YourAPIKey";
-const char* serverName = "www.circuitdigest.cloud";
-const char* serverPath = "/api/v1/helmet-detection/detect";
-const int   serverPort = 443;
-```
-
-Defines Wi-Fi credentials and the cloud API endpoint. The API key is used for authentication on every request. The `serverPath` points directly to the **helmet detection model** running in the cloud.
-
----
-
-### 3. Camera Pin Mapping
-
-```cpp
-#define PWDN_GPIO_NUM  32
-#define XCLK_GPIO_NUM   0
-#define Y2_GPIO_NUM     5
-#define Y3_GPIO_NUM    18
-#define Y9_GPIO_NUM    35
-#define PCLK_GPIO_NUM  22
-// ... (remaining pins)
-```
-
-Maps ESP32 GPIO pins to the camera module's data lines, clock, and synchronization signals. A correct pin configuration is essential for stable and reliable image capture.
-
----
-
-### 4. Camera Initialization
-
-```cpp
-void initCamera() {
-  camera_config_t cfg = {};
-  cfg.pixel_format = PIXFORMAT_JPEG;
-  cfg.frame_size   = FRAMESIZE_VGA;
-  cfg.jpeg_quality = 10;
-  cfg.fb_count     = 1;
-  esp_camera_init(&cfg);
-}
-```
-
-Initializes the camera in **JPEG format** at **VGA resolution**, balancing transfer speed and image quality. This ensures the camera is fully ready before any image is captured and sent to the API.
-
----
-
-### 5. Capture & Send to API
-
-```cpp
-camera_fb_t* fb = esp_camera_fb_get();
-
-client.connect(serverName, serverPort);
-client.println("POST " + String(serverPath) + " HTTP/1.1");
-client.println("X-API-Key: " + String(API_KEY));
-client.write(fb->buf, fb->len);
-
-esp_camera_fb_return(fb);
-```
-
-On button press, captures a JPEG image and transmits it to the CircuitDigest Cloud API via an **HTTPS POST** request. After transmission, the frame buffer is released to free memory and prevent overflow.
-
----
-
-### 6. Parse & Display Result
-
-```cpp
-String result = sendImageToAPI(fb);
-Serial.println("Response: " + result);
-```
-
-Receives the cloud server's response after image processing. The API returns helmet detection results in **JSON format**, which are then printed on the Serial Monitor for easy viewing and debugging.
-
----
-
-## 📊 Output
-
-After pressing the push button, the Serial Monitor displays:
-
-```
-Connecting to WiFi...
-WiFi Connected!
-Button Pressed - Capturing Image...
-Image Captured. Sending to API...
-
---- Helmet Detection Result ---
-Motorbikes Detected : 4
-With Helmet         : 2  (Confidence: 97.1%)
-Without Helmet      : 2  (Confidence: 94.6%)
-
-⚠️  WARNING: Riders without helmets detected!
-```
-
-> Results include **motorbike count**, **helmet wearers**, **non-helmet wearers**, and **confidence scores** for each detection.
+7. Point the camera at riders and after the power on of red led it will automatically capture the picture.
+8. Helmet detection results appear on the Serial Monitor within seconds and the notification will be send!
 
 ---
 
