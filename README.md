@@ -40,10 +40,6 @@ Think of a busy road where hundreds of riders pass every minute — some wearing
 
 That's exactly what this project delivers. Instead of depending on heavy hardware or complex local processing, a compact **ESP32-CAM** captures the image and sends it securely to the **CircuitDigest Cloud**, where powerful AI models analyze it and detect helmet usage within seconds.
 
-> **Press a button → Capture image → Cloud AI detects helmets → Count of helmet/no-helmet riders + motorbikes shown on Serial Monitor**
-
-What feels like a high-end surveillance system is now reduced to a simple, affordable setup that anyone can build and deploy. ⚡
-
 ---
 
 ## 🧰 Components Required
