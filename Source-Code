@@ -1,17 +1,46 @@
+/*
+ * ESP32-CAM Helmet Detection + WhatsApp Alert  — v5
+ * WhatsApp now sends plain JSON (no multipart, no image upload).
+ * Payload:
+ * {
+ *   "phone_number": "91xxxxxxxxxx",
+ *   "template_id": "image_capture_alert",
+ *   "variables": {
+ *     "event_type": "<helmet status>",
+ *     "location": "Entrance",
+ *     "device_name": "ESP32-CAM Helmet",
+ *     "captured_time": "<IST timestamp>",
+ *     "api_result": "<full detection JSON>"
+ *   }
+ * }
+ */
+
 #include "esp_camera.h"
+#include "esp_tls.h"
+#include "esp_crt_bundle.h"
+#include "esp_sntp.h"
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
-#include <WebServer.h>
+#include <time.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/semphr.h"
 
-const char* WIFI_SSID  = "yourssidname";
-const char* WIFI_PASS  = "yourwifipassword";
-const char* API_KEY    = "YourApiKey";
-const char* serverName = "www.circuitdigest.cloud";
-const char* serverPath = "/api/v1/helmet-detection/detect";
-const int   serverPort = 443;
+// ─── Credentials ──────────────────────────────────────────────────
+const char* WIFI_SSID = "Yourssid";
+const char* WIFI_PASS = "yourwifipassowrd";
+const char* API_KEY   = "yourapikey";
+const char* PHONE     = "yourname";
 
-#define TRIGGER_BTN 13
+// ─── Pins ─────────────────────────────────────────────────────────
+#define GREEN_LED 15
+#define RED_LED   14
 
+// ─── Timing ───────────────────────────────────────────────────────
+#define GREEN_MS      5000UL
+#define RED_WAIT_MS   5000UL
+#define RED_AFTER_MS   5000UL
+
+// ─── Camera Pins (AI-Thinker ESP32-CAM) ───────────────────────────
 #define PWDN_GPIO_NUM  32
 #define RESET_GPIO_NUM -1
 #define XCLK_GPIO_NUM   0
@@ -29,210 +58,405 @@ const int   serverPort = 443;
 #define HREF_GPIO_NUM  23
 #define PCLK_GPIO_NUM  22
 
-WiFiClientSecure client;
-WebServer previewServer(80);
-unsigned long lastTrigger = 0;
+// ─── Shared state ─────────────────────────────────────────────────
+static uint8_t* g_imgBuf  = nullptr;
+static size_t   g_imgLen  = 0;
+static char     g_status[64]   = "Unknown";
+static char     g_imageUrl[256] = "";
+static char     g_jsonBuf[2048] = {};
 
-volatile bool streamingActive = false;  // is someone watching the stream?
-volatile bool buttonPressed   = false;  // button was pressed, pause stream
+static SemaphoreHandle_t g_startSem = nullptr;
+static SemaphoreHandle_t g_doneSem  = nullptr;
 
-SemaphoreHandle_t cameraMutex;          // ← only one task uses camera at a time
+// ─── Utilities ────────────────────────────────────────────────────
+static void printHeap(const char* tag) {
+  Serial.printf("[HEAP] %s: free=%u largest=%u psram=%u\n", tag,
+    (unsigned)ESP.getFreeHeap(),
+    (unsigned)ESP.getMaxAllocHeap(),
+    (unsigned)ESP.getFreePsram());
+}
 
-void initCamera() {
+static void ensureWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  Serial.print("[WiFi] reconnecting");
+  WiFi.disconnect(true);
+  vTaskDelay(pdMS_TO_TICKS(500));
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  for (uint32_t t = millis(); WiFi.status() != WL_CONNECTED;) {
+    if (millis() - t > 20000) { Serial.println("\n[WiFi] timeout→reboot"); ESP.restart(); }
+    vTaskDelay(pdMS_TO_TICKS(500));
+    Serial.print(".");
+  }
+  Serial.printf("\n[WiFi] %s\n", WiFi.localIP().toString().c_str());
+}
+
+// ─── Camera ───────────────────────────────────────────────────────
+static bool initCam() {
   camera_config_t cfg = {};
   cfg.ledc_channel = LEDC_CHANNEL_0; cfg.ledc_timer = LEDC_TIMER_0;
-  cfg.pin_d0 = Y2_GPIO_NUM;   cfg.pin_d1 = Y3_GPIO_NUM;
-  cfg.pin_d2 = Y4_GPIO_NUM;   cfg.pin_d3 = Y5_GPIO_NUM;
-  cfg.pin_d4 = Y6_GPIO_NUM;   cfg.pin_d5 = Y7_GPIO_NUM;
-  cfg.pin_d6 = Y8_GPIO_NUM;   cfg.pin_d7 = Y9_GPIO_NUM;
-  cfg.pin_xclk     = XCLK_GPIO_NUM;  cfg.pin_pclk  = PCLK_GPIO_NUM;
-  cfg.pin_vsync    = VSYNC_GPIO_NUM; cfg.pin_href  = HREF_GPIO_NUM;
-  cfg.pin_sscb_sda = SIOD_GPIO_NUM;  cfg.pin_sscb_scl = SIOC_GPIO_NUM;
-  cfg.pin_pwdn     = PWDN_GPIO_NUM;  cfg.pin_reset = RESET_GPIO_NUM;
+  cfg.pin_d0=Y2_GPIO_NUM; cfg.pin_d1=Y3_GPIO_NUM; cfg.pin_d2=Y4_GPIO_NUM;
+  cfg.pin_d3=Y5_GPIO_NUM; cfg.pin_d4=Y6_GPIO_NUM; cfg.pin_d5=Y7_GPIO_NUM;
+  cfg.pin_d6=Y8_GPIO_NUM; cfg.pin_d7=Y9_GPIO_NUM;
+  cfg.pin_xclk=XCLK_GPIO_NUM;   cfg.pin_pclk=PCLK_GPIO_NUM;
+  cfg.pin_vsync=VSYNC_GPIO_NUM; cfg.pin_href=HREF_GPIO_NUM;
+  cfg.pin_sscb_sda=SIOD_GPIO_NUM; cfg.pin_sscb_scl=SIOC_GPIO_NUM;
+  cfg.pin_pwdn=PWDN_GPIO_NUM;   cfg.pin_reset=RESET_GPIO_NUM;
   cfg.xclk_freq_hz = 20000000;
   cfg.pixel_format = PIXFORMAT_JPEG;
-  cfg.frame_size   = FRAMESIZE_VGA;
-  cfg.jpeg_quality = 10;
-  cfg.fb_count     = 2;
-
-  if (esp_camera_init(&cfg) != ESP_OK) {
-    Serial.println("Camera init failed!"); while (1) delay(1000);
+  if (psramFound()) {
+    cfg.frame_size=FRAMESIZE_VGA; cfg.jpeg_quality=12;
+    cfg.fb_count=2; cfg.fb_location=CAMERA_FB_IN_PSRAM;
+  } else {
+    cfg.frame_size=FRAMESIZE_QVGA; cfg.jpeg_quality=15;
+    cfg.fb_count=1; cfg.fb_location=CAMERA_FB_IN_DRAM;
   }
+  esp_err_t e = esp_camera_init(&cfg);
+  if (e != ESP_OK) { Serial.printf("[CAM] init fail 0x%x\n", e); return false; }
   sensor_t* s = esp_camera_sensor_get();
-  s->set_brightness(s, 1); s->set_contrast(s, 2);
-  s->set_saturation(s, 0); s->set_whitebal(s, 1);
-  s->set_exposure_ctrl(s, 1); s->set_gain_ctrl(s, 1);
-  s->set_aec2(s, 1); s->set_ae_level(s, 1);
-  Serial.println("Camera initialized.");
+  if (s) {
+    s->set_whitebal(s,1); s->set_awb_gain(s,1);
+    s->set_exposure_ctrl(s,1); s->set_aec2(s,1);
+  }
+  return true;
 }
 
-// ─── Runs on Core 0 — handles web server + streaming ──────────
-void webServerTask(void* param) {
-  while (true) {
-    previewServer.handleClient();
-    vTaskDelay(1);   // yield to other tasks
+// ─── esp_tls helpers ──────────────────────────────────────────────
+static bool tlsWriteAll(esp_tls_t* tls, const uint8_t* buf, size_t len) {
+  size_t sent = 0;
+  while (sent < len) {
+    int n = esp_tls_conn_write(tls, buf + sent, len - sent);
+    if (n < 0) { Serial.printf("[TLS] write err %d\n", n); return false; }
+    sent += n;
+    if (sent % 4096 == 0) vTaskDelay(pdMS_TO_TICKS(5));
+  }
+  return true;
+}
+
+static size_t tlsReadAll(esp_tls_t* tls, char* buf, size_t maxLen) {
+  size_t total = 0;
+  uint32_t t = millis();
+  while (total < maxLen - 1) {
+    if (millis() - t > 10000) break;
+    int n = esp_tls_conn_read(tls, buf + total, maxLen - 1 - total);
+    if (n == 0) break;
+    if (n == ESP_TLS_ERR_SSL_WANT_READ) { vTaskDelay(pdMS_TO_TICKS(10)); continue; }
+    if (n < 0) break;
+    total += n; t = millis();
+  }
+  buf[total] = '\0';
+  return total;
+}
+
+static void skipHeaders(char* resp, size_t len, size_t* bodyStart) {
+  *bodyStart = 0;
+  for (size_t i = 0; i + 3 < len; i++) {
+    if (resp[i]=='\r' && resp[i+1]=='\n' && resp[i+2]=='\r' && resp[i+3]=='\n') {
+      *bodyStart = i + 4; return;
+    }
   }
 }
 
-void handleRoot() {
-  previewServer.send(200, "text/html",
-    "<html><head>"
-    "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-    "<script>"
-    // auto-reconnect stream if it drops (after detection finishes)
-    "window.onload=function(){"
-    "  var img=document.getElementById('s');"
-    "  img.onerror=function(){setTimeout(function(){img.src='/stream?t='+Date.now();},3000);};"
-    "};"
-    "</script>"
-    "</head>"
-    "<body style='background:#000;text-align:center'>"
-    "<h2 style='color:#fff'>Camera Preview</h2>"
-    "<p style='color:#aaa'>Press physical button to capture &amp; detect</p>"
-    "<img id='s' src='/stream' style='width:100%;max-width:640px'>"
-    "</body></html>"
-  );
+static esp_tls_t* openTLS(const char* host, int port) {
+  esp_tls_cfg_t cfg = {};
+  cfg.crt_bundle_attach = esp_crt_bundle_attach;
+  cfg.non_block = false;
+  for (int i = 0; i < 3; i++) {
+    esp_tls_t* tls = esp_tls_init();
+    if (!tls) { vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
+    if (esp_tls_conn_new_sync(host, strlen(host), port, &cfg, tls) == 1) return tls;
+    Serial.printf("[TLS] attempt %d failed\n", i + 1);
+    esp_tls_conn_destroy(tls);
+    vTaskDelay(pdMS_TO_TICKS(1500));
+  }
+  return nullptr;
 }
 
-void handleStream() {
-  WiFiClient streamClient = previewServer.client();
-  streamClient.println("HTTP/1.1 200 OK");
-  streamClient.println("Content-Type: multipart/x-mixed-replace; boundary=frame");
-  streamClient.println();
+// ─── Helmet Detection ─────────────────────────────────────────────
+static bool detectHelmet() {
+  printHeap("detectHelmet");
+  const char* host = "www.circuitdigest.cloud";
+  const char* bnd  = "----ESP32Bound";
 
-  streamingActive = true;
+  char partHead[256];
+  int phLen = snprintf(partHead, sizeof(partHead),
+    "--%s\r\nContent-Disposition: form-data; name=\"imageFile\"; filename=\"snap.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n", bnd);
+  char partTail[64];
+  int ptLen = snprintf(partTail, sizeof(partTail), "\r\n--%s--\r\n", bnd);
+  size_t contentLen = phLen + g_imgLen + ptLen;
 
-  while (streamClient.connected()) {
-    // ← if button pressed, pause and wait until detection is done
-    if (buttonPressed) {
-      vTaskDelay(100 / portTICK_PERIOD_MS);
-      continue;   // keep connection alive but don't grab camera
-    }
+  char reqHdr[512];
+  int reqLen = snprintf(reqHdr, sizeof(reqHdr),
+    "POST /api/v1/helmet-detection/detect HTTP/1.1\r\n"
+    "Host: %s\r\nX-API-Key: %s\r\n"
+    "Content-Type: multipart/form-data; boundary=%s\r\n"
+    "Content-Length: %u\r\nConnection: close\r\n\r\n",
+    host, API_KEY, bnd, (unsigned)contentLen);
 
-    // ← try to get camera mutex (detection task might be using it)
-    if (xSemaphoreTake(cameraMutex, 10 / portTICK_PERIOD_MS) == pdTRUE) {
-      camera_fb_t* fb = esp_camera_fb_get();
-      xSemaphoreGive(cameraMutex);   // ← release immediately after get
+  esp_tls_t* tls = openTLS(host, 443);
+  if (!tls) return false;
 
-      if (fb) {
-        streamClient.println("--frame");
-        streamClient.println("Content-Type: image/jpeg");
-        streamClient.println("Content-Length: " + String(fb->len));
-        streamClient.println();
-        streamClient.write(fb->buf, fb->len);
-        streamClient.println();
-        esp_camera_fb_return(fb);
+  bool ok =
+    tlsWriteAll(tls, (const uint8_t*)reqHdr, reqLen) &&
+    tlsWriteAll(tls, (const uint8_t*)partHead, phLen) &&
+    tlsWriteAll(tls, g_imgBuf, g_imgLen) &&
+    tlsWriteAll(tls, (const uint8_t*)partTail, ptLen);
+
+  static char respBuf[3072];
+  if (ok) tlsReadAll(tls, respBuf, sizeof(respBuf));
+  esp_tls_conn_destroy(tls);
+  if (!ok) return false;
+
+  // Extract JSON body (handle chunked encoding)
+  size_t bodyStart = 0, respLen = strlen(respBuf);
+  skipHeaders(respBuf, respLen, &bodyStart);
+  size_t bodyLen = respLen - bodyStart;
+  if (bodyLen >= sizeof(g_jsonBuf)) bodyLen = sizeof(g_jsonBuf) - 1;
+  memcpy(g_jsonBuf, respBuf + bodyStart, bodyLen);
+  g_jsonBuf[bodyLen] = '\0';
+
+  // Strip chunked transfer size prefix if present (hex digits + \r\n)
+  char* s = g_jsonBuf;
+  while (*s && ((*s>='0'&&*s<='9')||(*s>='a'&&*s<='f')||(*s>='A'&&*s<='F'))) s++;
+  if (s != g_jsonBuf && *s == '\r') { s += 2; memmove(g_jsonBuf, s, strlen(s) + 1); }
+
+  Serial.printf("[API] %s\n", g_jsonBuf);
+  return g_jsonBuf[0] != '\0';
+}
+
+// ─── Parse Status ─────────────────────────────────────────────────
+static void parseStatus() {
+  const char* j = g_jsonBuf;
+
+  // Extract image_url
+  g_imageUrl[0] = '\0';
+  const char* url_key = "\"image_url\":\"";
+  const char* ui = strstr(j, url_key);
+  if (ui) {
+    const char* vs = ui + strlen(url_key);
+    const char* ve = strchr(vs, '"');
+    if (ve && ve > vs) {
+      size_t len = ve - vs;
+      if (len >= sizeof(g_imageUrl)) len = sizeof(g_imageUrl) - 1;
+      strncpy(g_imageUrl, vs, len);
+      g_imageUrl[len] = '\0';
+      
+      // Unescape forward slashes if any (e.g., '\/' -> '/')
+      char* p = g_imageUrl;
+      char* q = g_imageUrl;
+      while(*p) {
+        if(*p == '\\' && *(p+1) == '/') p++;
+        *q++ = *p++;
       }
+      *q = '\0';
+      Serial.printf("[DEBUG] Extracted Image URL: %s\n", g_imageUrl);
     }
-    vTaskDelay(50 / portTICK_PERIOD_MS);  // ~20fps
   }
 
-  streamingActive = false;
+  if (strstr(j,"\"helmet\":true") || strstr(j,"\"helmet_detected\":true"))
+    { strncpy(g_status,"Helmet Detected",   sizeof(g_status)); return; }
+  if (strstr(j,"\"helmet\":false") || strstr(j,"\"helmet_detected\":false"))
+    { strncpy(g_status,"No Helmet Detected", sizeof(g_status)); return; }
+  const char* si = strstr(j,"\"status\":\"");
+  if (si) {
+    const char* vs = si + 10, *ve = strchr(vs, '"');
+    if (ve && ve > vs) {
+      size_t vl = (size_t)(ve - vs);
+      if (strncmp(vs,"helmet_detected",vl)==0) { strncpy(g_status,"Helmet Detected",   sizeof(g_status)); return; }
+      if (strncmp(vs,"no_helmet",      vl)==0) { strncpy(g_status,"No Helmet Detected", sizeof(g_status)); return; }
+      if (strncmp(vs,"no_detections",  vl)==0) { strncpy(g_status,"No Person/Helmet",   sizeof(g_status)); return; }
+    }
+  }
+  strncpy(g_status,"Detection Complete", sizeof(g_status));
 }
 
-// ─── Original API code untouched ──────────────────────────────
-String sendImageToAPI(camera_fb_t* fb) {
-  Serial.println("Connecting to server...");
-  if (!client.connect(serverName, serverPort)) {
-    Serial.println("Connection failed!");
-    return "Connection failed";
-  }
-  Serial.println("Connected!");
+// ─── WhatsApp — plain JSON, no multipart ─────────────────────────
+// Sends:
+// POST /api/v1/whatsapp/send  (JSON only, no image)
+// {
+//   "phone_number": "91xxxxxxxxxx",
+//   "template_id":  "image_capture_alert",
+//   "variables": {
+//     "event_type":    "<status>",
+//     "location":      "Entrance",
+//     "device_name":   "ESP32-CAM Helmet",
+//     "captured_time": "<IST time>",
+//     "image_link":    "annoted_image_link"
+//   }
+// }
+static void sendWhatsApp() {
+  printHeap("sendWhatsApp");
 
-  String boundary = "----ESP32Boundary";
-  String head = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"imageFile\"; filename=\"snap.jpg\"\r\nContent-Type: image/jpeg\r\n\r\n";
-  String tail = "\r\n--" + boundary + "--\r\n";
-  int contentLen = head.length() + fb->len + tail.length();
+  const char* host = "www.circuitdigest.cloud";
 
-  client.println("POST " + String(serverPath) + " HTTP/1.1");
-  client.println("Host: " + String(serverName));
-  client.println("X-API-Key: " + String(API_KEY));
-  client.println("Content-Type: multipart/form-data; boundary=" + boundary);
-  client.println("Content-Length: " + String(contentLen));
-  client.println("Connection: close");
-  client.println();
-  client.print(head);
-  client.write(fb->buf, fb->len);
-  client.print(tail);
+  // Timestamp
+  char ts[64] = "Time Unknown";
+  struct tm ti;
+  if (getLocalTime(&ti, 500)) strftime(ts, sizeof(ts), "%I:%M %p, %B %d, %Y", &ti);
 
-  Serial.println("Image sent! Waiting for response...");
-  long t = millis();
-  while (!client.available()) {
-    if (millis() - t > 15000) { client.stop(); return "Timeout"; }
-  }
+  // ── Build JSON body ────────────────────────────────────────────
+  char reqBody[1024];
+  int bodyLen = snprintf(reqBody, sizeof(reqBody),
+    "{"
+      "\"phone_number\":\"%s\","
+      "\"template_id\":\"image_capture_alert\","
+      "\"variables\":{"
+        "\"event_type\":\"%s\","
+        "\"location\":\"CircuitDIgest Office signal\","
+        "\"device_name\":\"ESP32-CAM Helmet\","
+        "\"captured_time\":\"%s\","
+        "\"image_link\":\"%s\""
+      "}"
+    "}",
+    PHONE, g_status, ts, g_imageUrl);
 
-  String response = "";
-  while (client.available()) response += (char)client.read();
-  client.stop();
+  Serial.printf("[DEBUG] WA Payload: %s\n", reqBody);
 
-  int j = response.indexOf("\r\n\r\n");
-  return (j != -1) ? response.substring(j + 4) : response;
+  // HTTP request header
+  char reqHdr[512];
+  int reqLen = snprintf(reqHdr, sizeof(reqHdr),
+    "POST /api/v1/whatsapp/send HTTP/1.1\r\n"
+    "Host: %s\r\n"
+    "Authorization: %s\r\n"
+    "Content-Type: application/json\r\n"
+    "Content-Length: %u\r\n"
+    "Connection: close\r\n\r\n",
+    host, API_KEY, (unsigned)bodyLen);
+
+  // ── Open TLS and stream everything ────────────────────────────
+  esp_tls_t* tls = openTLS(host, 443);
+  if (!tls) { Serial.println("[WA] TLS open failed"); return; }
+
+  // 1. HTTP headers
+  tlsWriteAll(tls, (const uint8_t*)reqHdr, reqLen);
+
+  // 2. JSON Body
+  tlsWriteAll(tls, (const uint8_t*)reqBody, bodyLen);
+
+  // ── Read response ──────────────────────────────────────────────
+  static char respBuf[1024];
+  tlsReadAll(tls, respBuf, sizeof(respBuf));
+  esp_tls_conn_destroy(tls);
+
+  // Log first line (HTTP status)
+  char* nl = strchr(respBuf, '\n');
+  if (nl) *nl = '\0';
+  Serial.printf("[WA] %s\n", respBuf);
 }
 
-void checkHelmets() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi disconnected! Reconnecting...");
-    WiFi.begin(WIFI_SSID, WIFI_PASS);
-    int tries = 0;
-    while (WiFi.status() != WL_CONNECTED && tries < 20) {
-      delay(500); Serial.print("."); tries++;
-    }
-    if (WiFi.status() != WL_CONNECTED) {
-      Serial.println("WiFi reconnect failed!");
-      return;
-    }
-    Serial.println("WiFi reconnected!");
+// ─── Network Task ─────────────────────────────────────────────────
+static void networkTask(void* /*arg*/) {
+  Serial.println("[NET] task started");
+  for (;;) {
+    xSemaphoreTake(g_startSem, portMAX_DELAY);
+    ensureWiFi();
+
+    bool ok = detectHelmet();
+    if (ok) parseStatus();
+    else strncpy(g_status, "Detection Failed", sizeof(g_status));
+    Serial.printf("[STATUS] %s\n", g_status);
+
+    sendWhatsApp();
+
+    xSemaphoreGive(g_doneSem);
   }
+}
 
-  // ← take mutex so stream task can't grab camera at same time
-  xSemaphoreTake(cameraMutex, portMAX_DELAY);
+// ─── Capture Frame ────────────────────────────────────────────────
+static bool captureFrame() {
+  camera_fb_t* wf = esp_camera_fb_get();
+  if (wf) esp_camera_fb_return(wf);
+  vTaskDelay(pdMS_TO_TICKS(400));
 
-  camera_fb_t* fb = esp_camera_fb_get();   // warm-up
+  camera_fb_t* fb = esp_camera_fb_get();
+  if (!fb) { Serial.println("[CAM] capture failed"); return false; }
+  Serial.printf("[CAM] frame %u bytes\n", (unsigned)fb->len);
+
+  g_imgLen = fb->len;
+  if (g_imgBuf) { free(g_imgBuf); g_imgBuf = nullptr; }
+
+  if (psramFound() && ESP.getFreePsram() > g_imgLen + 8192)
+    g_imgBuf = (uint8_t*)ps_malloc(g_imgLen);
+  if (!g_imgBuf && ESP.getMaxAllocHeap() > g_imgLen + 32768)
+    g_imgBuf = (uint8_t*)malloc(g_imgLen);
+
+  if (!g_imgBuf) {
+    Serial.printf("[CAM] no memory (len=%u free=%u psram=%u)\n",
+      (unsigned)g_imgLen, (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getFreePsram());
+    esp_camera_fb_return(fb);
+    return false;
+  }
+  memcpy(g_imgBuf, fb->buf, g_imgLen);
   esp_camera_fb_return(fb);
-  delay(200);
-
-  fb = esp_camera_fb_get();
-  xSemaphoreGive(cameraMutex);   // ← release mutex after capture
-
-  if (!fb) { Serial.println("Capture failed"); return; }
-
-  Serial.println("Photo captured! Sending to API...");
-  String result = sendImageToAPI(fb);
-  esp_camera_fb_return(fb);
-  Serial.println("Response: " + result);
+  return true;
 }
 
+// ─── Setup ────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200);
-  pinMode(TRIGGER_BTN, INPUT_PULLUP);
+  vTaskDelay(pdMS_TO_TICKS(300));
+  Serial.println("\n=== ESP32-CAM Helmet Detection v5 ===");
 
-  cameraMutex = xSemaphoreCreateMutex();   // ← create mutex
+  pinMode(GREEN_LED, OUTPUT); digitalWrite(GREEN_LED, LOW);
+  pinMode(RED_LED,   OUTPUT); digitalWrite(RED_LED,   LOW);
 
-  initCamera();
-  client.setInsecure();
+  if (!initCam()) { Serial.println("[CAM] fatal"); while(true) vTaskDelay(pdMS_TO_TICKS(1000)); }
 
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  Serial.print("Connecting to WiFi");
-  while (!WiFi.isConnected()) { delay(500); Serial.print("."); }
-  Serial.println("\nConnected: " + WiFi.localIP().toString());
-  Serial.println("Preview at: http://" + WiFi.localIP().toString());
+  Serial.print("[WiFi] connecting");
+  for (uint32_t t = millis(); WiFi.status() != WL_CONNECTED;) {
+    if (millis() - t > 30000) { Serial.println("\ntimeout"); ESP.restart(); }
+    vTaskDelay(pdMS_TO_TICKS(500)); Serial.print(".");
+  }
+  Serial.printf("\n[WiFi] Connected: %s\n", WiFi.localIP().toString().c_str());
 
-  previewServer.on("/", handleRoot);
-  previewServer.on("/stream", handleStream);
-  previewServer.begin();
+  esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+  esp_sntp_setservername(0, "pool.ntp.org");
+  esp_sntp_setservername(1, "time.nist.gov");
+  esp_sntp_init();
+  Serial.print("[NTP] syncing");
+  for (int i = 0; i < 20 && sntp_get_sync_status() != SNTP_SYNC_STATUS_COMPLETED; i++) {
+    vTaskDelay(pdMS_TO_TICKS(500)); Serial.print(".");
+  }
+  Serial.println(sntp_get_sync_status() == SNTP_SYNC_STATUS_COMPLETED ? " OK" : " (timeout)");
 
-  // ← web server runs on Core 0, loop() runs on Core 1
-  xTaskCreatePinnedToCore(webServerTask, "webTask", 8192, NULL, 1, NULL, 0);
+  g_startSem = xSemaphoreCreateBinary();
+  g_doneSem  = xSemaphoreCreateBinary();
+  xTaskCreatePinnedToCore(networkTask, "net_task", 8192, nullptr, 5, nullptr, 0);
+
+  printHeap("setup complete");
+  Serial.println("[READY]");
 }
 
+// ─── Main Loop ────────────────────────────────────────────────────
 void loop() {
-  // ← this now always runs freely on Core 1, never blocked by streaming
-  if (digitalRead(TRIGGER_BTN) == LOW && millis() - lastTrigger > 500) {
-    lastTrigger = millis();
-    Serial.println("Button pressed! Capturing...");
-    buttonPressed = true;    // ← tell stream to pause
-    delay(100);              // ← wait for stream to pause
-    checkHelmets();          // ← detect
-    buttonPressed = false;   // ← stream resumes automatically
+  Serial.println("[GREEN] 10 s");
+  digitalWrite(GREEN_LED, HIGH); digitalWrite(RED_LED, LOW);
+  for (uint32_t t = millis(); millis()-t < GREEN_MS;) vTaskDelay(pdMS_TO_TICKS(100));
+
+  Serial.println("[RED] warning 10 s");
+  digitalWrite(GREEN_LED, LOW); digitalWrite(RED_LED, HIGH);
+  for (uint32_t t = millis(); millis()-t < RED_WAIT_MS;) vTaskDelay(pdMS_TO_TICKS(100));
+
+  Serial.println("[RED] capturing...");
+  printHeap("before capture");
+  if (!captureFrame()) {
+    for (uint32_t t = millis(); millis()-t < RED_AFTER_MS;) vTaskDelay(pdMS_TO_TICKS(100));
+    return;
   }
+  printHeap("after capture");
+
+  esp_camera_deinit();
+  vTaskDelay(pdMS_TO_TICKS(300));
+
+  xSemaphoreGive(g_startSem);
+  xSemaphoreTake(g_doneSem, portMAX_DELAY);
+
+  if (g_imgBuf) { free(g_imgBuf); g_imgBuf = nullptr; }
+
+  if (!initCam()) { Serial.println("[CAM] reinit failed"); ESP.restart(); }
+
+  Serial.println("[RED] post-detect 5 s");
+  for (uint32_t t = millis(); millis()-t < RED_AFTER_MS;) vTaskDelay(pdMS_TO_TICKS(100));
 }
