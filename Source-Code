@@ -12,7 +12,7 @@
 const char* WIFI_SSID = "Yourssid";
 const char* WIFI_PASS = "yourwifipassowrd";
 const char* API_KEY   = "yourapikey";
-const char* PHONE     = "yourname";
+const char* PHONE     = "yourphonenumber";
 
 // ─── Pins ─────────────────────────────────────────────────────────
 #define GREEN_LED 15
