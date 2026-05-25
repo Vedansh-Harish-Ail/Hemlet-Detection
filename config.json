@@ -1,6 +1,6 @@
 {
-  "api_key": "cd_ved_240526_waNUJr",
-  "phone_number": "6282277490",
+  "api_key": "YOUR-API-KEY",
+  "phone_number": "YOUR-PHONE-NUMBER",
   "enable_whatsapp": true,
   "camera_index": 0,
   "detection_mode": "manual",
