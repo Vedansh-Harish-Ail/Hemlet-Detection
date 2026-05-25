@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # 💻 Laptop & Webcam-Based Helmet Detection System (Python Refactored)
 
 <p align="center">
@@ -343,3 +344,6 @@ const char* API_KEY    = "Your_API_Key_Here";
 ---
 
 Made with ❤️ by [CircuitDigest](https://circuitdigest.com) | Powered by [CircuitDigest Cloud AI](https://circuitdigest.cloud)
+=======
+# Hemlet-Detection
+>>>>>>> 8e62747ebe503ee57ad82d31c36549c18e8fee2f
