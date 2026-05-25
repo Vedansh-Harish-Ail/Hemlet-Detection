@@ -1,0 +1,12 @@
+{
+  "api_key": "cd_ved_240526_waNUJr",
+  "phone_number": "6282277490",
+  "enable_whatsapp": true,
+  "camera_index": 0,
+  "detection_mode": "manual",
+  "auto_interval_seconds": 15,
+  "use_local_inference": true,
+  "save_no_helmet_screenshots": true,
+  "screenshot_directory": "screenshots"
+}
+ 
